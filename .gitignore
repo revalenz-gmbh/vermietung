@@ -1,0 +1,20 @@
+# Exclude GmbH accounting system (separate project)
+Buchhaltungssystem/
+
+# Google Apps Script specific
+.clasp.json
+.claspignore
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Temporary files
+*.tmp
+*.bak
+*~
