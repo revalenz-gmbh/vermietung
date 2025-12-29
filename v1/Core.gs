@@ -22,7 +22,7 @@ function createMenu() {
   const menu = ui.createMenu('📊 Vermietung');
 
   // Haupt-Funktionen
-  menu.addItem('📥 CSV-Import (Bank/Airbnb)', 'importCSV');
+  menu.addItem('📋 Kontobewegungen öffnen', 'oeffneKontobewegungen');
   menu.addSeparator();
 
   // Kontobewegungen
@@ -116,7 +116,7 @@ function setupSystem() {
     Logger.log('6/11 Kategorienmapping...');
     initializeKategorienmapping();
 
-    // 7. Kontobewegungen
+    // 7. Kontobewegungen (Staging für CSV-Import)
     Logger.log('7/11 Kontobewegungen...');
     initializeKontobewegungen();
 
@@ -154,7 +154,10 @@ function setupSystem() {
       '2. Immobilien & Räume eintragen (Sheets "Immobilien", "Räume")\n' +
       '3. Mietverträge anlegen (Sheet "Mietverträge")\n' +
       '4. Kategorienmapping anpassen (Sheet "Kategorienmapping")\n' +
-      '5. CSV importieren (📊 Vermietung → 📥 CSV-Import)',
+      '5. CSV importieren:\n' +
+      '   • Menü → 📋 Kontobewegungen öffnen\n' +
+      '   • CSV-Daten per Copy & Paste einfügen\n' +
+      '   • Kategorien zuordnen → Buchen',
       'Setup abgeschlossen'
     );
 
@@ -166,41 +169,33 @@ function setupSystem() {
 
 /**
  * CSV-IMPORT - Vereinfacht für Vermietung
- * Kopiert Logik von GmbH-System, angepasst für single-entry
+ * Öffnet HTML-Dialog für Datei-Upload
  */
 function importCSV() {
   try {
-    const ui = SpreadsheetApp.getUi();
+    const html = HtmlService.createHtmlOutputFromFile('CSVImportDialog')
+      .setWidth(550)
+      .setHeight(400);
+    
+    SpreadsheetApp.getUi()
+      .showModalDialog(html, '📥 CSV-Datei importieren');
 
-    showAlert(
-      'CSV-Import Anleitung:\n\n' +
-      '1. Öffnen Sie Ihr Online-Banking\n' +
-      '2. Exportieren Sie Kontobewegungen als CSV\n' +
-      '3. Kopieren Sie den CSV-Inhalt\n' +
-      '4. Fügen Sie ihn in die nächste Eingabemaske ein\n\n' +
-      'Unterstützte Formate:\n' +
-      '• Standard-CSV (Datum, Betrag, Verwendungszweck)\n' +
-      '• Sparkasse, Volksbank, etc.\n' +
-      '• Airbnb-Exporte',
-      'CSV-Import'
-    );
+  } catch (e) {
+    logError('importCSV', e);
+    showAlert('❌ Fehler beim Öffnen des Import-Dialogs:\n' + e.toString(), 'Fehler');
+  }
+}
 
-    // Zeige Eingabe-Dialog
-    const response = ui.prompt(
-      'CSV-Import',
-      'Bitte CSV-Inhalt einfügen (mehrere Zeilen):',
-      ui.ButtonSet.OK_CANCEL
-    );
-
-    if (response.getSelectedButton() !== ui.Button.OK) {
-      return;
-    }
-
-    const csvText = response.getResponseText();
-
+/**
+ * Callback-Funktion für CSV-Import aus HTML-Dialog
+ * Wird vom HTML-Dialog aufgerufen
+ * @param {string} csvText - CSV-Inhalt aus Datei
+ * @returns {Object} {erfolg, importiert, duplikate, fehler}
+ */
+function processCSVImportFromDialog(csvText) {
+  try {
     if (!csvText || csvText.trim().length === 0) {
-      showAlert('Keine Daten eingegeben!', 'Fehler');
-      return;
+      return { erfolg: false, fehler: 'Keine Daten in der Datei!' };
     }
 
     showToast('Importiere CSV...', 'Bitte warten', 5);
@@ -227,13 +222,13 @@ function importCSV() {
       if (sheet) {
         ss.setActiveSheet(sheet);
       }
-    } else {
-      showAlert('❌ Import fehlgeschlagen:\n' + result.fehler, 'Fehler');
     }
 
+    return result;
+
   } catch (e) {
-    logError('importCSV', e);
-    showAlert('❌ Fehler beim Import:\n' + e.toString(), 'Fehler');
+    logError('processCSVImportFromDialog', e);
+    return { erfolg: false, fehler: e.toString() };
   }
 }
 
@@ -257,9 +252,28 @@ function processCSVImport(csvText, bankkontoOverride = null) {
       return { erfolg: false, fehler: 'CSV-Datei ist leer!' };
     }
 
-    // Erkenne Header
-    const headerRow = rows[0];
-    const columnMapping = detectColumnMapping(headerRow);
+    // Erkenne Header (kann mehrere Zeilen sein)
+    let headerRowIndex = 0;
+    let columnMapping = detectColumnMapping(rows[0]);
+    
+    // Prüfe ob erste Zeile wirklich Header ist (enthält Datum/Betrag-Header)
+    // Wenn nicht, versuche nächste Zeile
+    if (!isValidHeaderRow(rows[0])) {
+      // Vielleicht ist Zeile 1 oder 2 der Header
+      for (let h = 1; h < Math.min(3, rows.length); h++) {
+        const testMapping = detectColumnMapping(rows[h]);
+        if (isValidHeaderRow(rows[h])) {
+          headerRowIndex = h;
+          columnMapping = testMapping;
+          Logger.log('Header in Zeile ' + (h + 1) + ' gefunden');
+          break;
+        }
+      }
+    }
+
+    // Validierung: Prüfe ob gefundene Spalten tatsächlich die richtigen Daten enthalten
+    // Suche in ersten Datenzeilen nach Datumswerten
+    columnMapping = validateAndFixColumnMapping(rows, headerRowIndex, columnMapping);
 
     Logger.log('Spalten-Mapping: ' + JSON.stringify(columnMapping));
 
@@ -298,11 +312,14 @@ function processCSVImport(csvText, bankkontoOverride = null) {
       }
     }
 
-    // Importiere Zeilen
+    // Importiere Zeilen (Batch-Verarbeitung für Performance)
     let importiert = 0;
     let duplikate = 0;
+    const neueBewegungen = [];  // Sammle alle neuen Bewegungen
 
-    for (let i = 1; i < rows.length; i++) {
+    // Starte nach Header-Zeile
+    const startRow = headerRowIndex + 1;
+    for (let i = startRow; i < rows.length; i++) {
       const row = rows[i];
 
       if (row.length < 3) continue;  // Zu kurze Zeile
@@ -329,8 +346,8 @@ function processCSVImport(csvText, bankkontoOverride = null) {
         continue;
       }
 
-      // Füge zu Kontobewegungen hinzu
-      addKontobewegung({
+      // Sammle Daten für Batch-Import
+      neueBewegungen.push({
         bankkonto: bankkonto,
         datum: parsedDatum,
         betrag: parsedBetrag,
@@ -338,6 +355,11 @@ function processCSVImport(csvText, bankkontoOverride = null) {
       });
 
       importiert++;
+    }
+
+    // Batch-Import: Alle Bewegungen auf einmal schreiben
+    if (neueBewegungen.length > 0) {
+      addKontobewegungenBatch(neueBewegungen);
     }
 
     Logger.log('CSV-Import: ' + importiert + ' importiert, ' + duplikate + ' Duplikate');
@@ -400,24 +422,152 @@ function detectColumnMapping(headerRow) {
   const mapping = { datum: -1, betrag: -1, verwendungszweck: -1 };
 
   headerRow.forEach((header, index) => {
-    const h = header.toLowerCase();
+    const h = header.toLowerCase().trim();
 
-    if (h.includes('datum') || h.includes('valuta') || h.includes('buchung')) {
-      mapping.datum = index;
+    // Datum-Header (PRIORISIERT: spezifische Datums-Header zuerst)
+    // WICHTIG: "buchungstag" und "valutadatum" haben Vorrang vor "buchungstext"
+    if (h.includes('buchungstag') || h.includes('valutadatum') || h.includes('wertstellung')) {
+      // Beste Option: explizite Datums-Header
+      if (mapping.datum === -1) mapping.datum = index;
+    } else if ((h.includes('datum') || h.includes('valuta') || h.includes('date') || h.includes('buchungsdatum')) && 
+                !h.includes('text') && !h.includes('buchungstext')) {
+      // Sekundäre Option: Datum-Header, aber NICHT "buchungstext"
+      if (mapping.datum === -1) mapping.datum = index;
+    } else if (h.includes('buchung') && !h.includes('text') && !h.includes('buchungstext')) {
+      // Fallback: "buchung" aber nicht "buchungstext"
+      if (mapping.datum === -1) mapping.datum = index;
     }
-    if (h.includes('betrag') || h.includes('umsatz') || h.includes('amount')) {
-      mapping.betrag = index;
+    
+    // Betrag-Header (erweitert)
+    if (h.includes('betrag') || h.includes('umsatz') || h.includes('amount') ||
+        h.includes('saldo') || h.includes('soll') || h.includes('haben') ||
+        h.includes('euro') || h.includes('eur')) {
+      if (mapping.betrag === -1) mapping.betrag = index;
     }
-    if (h.includes('verwendung') || h.includes('text') || h.includes('beschreibung') || h.includes('description')) {
-      mapping.verwendungszweck = index;
+    
+    // Verwendungszweck-Header (erweitert)
+    // WICHTIG: "buchungstext" ist KEIN Verwendungszweck, sondern Transaktionstyp
+    // Aber wir nutzen es als Fallback wenn nichts anderes gefunden wird
+    if (h.includes('verwendung') || h.includes('zweck') || h.includes('beschreibung') ||
+        h.includes('description') || h.includes('notiz') || h.includes('bemerkung') ||
+        h.includes('info') || h.includes('details')) {
+      if (mapping.verwendungszweck === -1) mapping.verwendungszweck = index;
+    } else if (h.includes('buchungstext') || h.includes('text')) {
+      // "buchungstext" nur als letzter Fallback für Verwendungszweck
+      if (mapping.verwendungszweck === -1) mapping.verwendungszweck = index;
     }
   });
 
-  // Fallback: Erste 3 Spalten
+  return mapping;
+}
+
+/**
+ * Prüft ob eine Zeile ein gültiger Header ist
+ */
+function isValidHeaderRow(row) {
+  if (!row || row.length === 0) return false;
+  
+  const rowText = row.join(' ').toLowerCase();
+  const hasDatum = rowText.includes('datum') || rowText.includes('valuta') || rowText.includes('buchung');
+  const hasBetrag = rowText.includes('betrag') || rowText.includes('umsatz') || rowText.includes('amount');
+  
+  return hasDatum || hasBetrag;
+}
+
+/**
+ * Validiert und korrigiert Spalten-Mapping durch Analyse der Datenzeilen
+ */
+function validateAndFixColumnMapping(rows, headerRowIndex, mapping) {
+  if (rows.length <= headerRowIndex + 1) {
+    return mapping; // Keine Datenzeilen vorhanden
+  }
+
+  const numTestRows = Math.min(10, rows.length - headerRowIndex - 1);
+  const testRows = rows.slice(headerRowIndex + 1, headerRowIndex + 1 + numTestRows);
+  
+  // Zähle wie oft jede Spalte ein gültiges Datum enthält
+  const datumScores = {};
+  const betragScores = {};
+  
+  for (let col = 0; col < Math.max(...testRows.map(r => r.length)); col++) {
+    let datumCount = 0;
+    let betragCount = 0;
+    
+    for (let i = 0; i < testRows.length; i++) {
+      if (col < testRows[i].length) {
+        const value = testRows[i][col];
+        if (value && parseDatumDeutsch(value)) {
+          datumCount++;
+        }
+        // Prüfe ob es ein Betrag sein könnte (Zahl mit Komma/Punkt)
+        if (value && typeof value === 'string') {
+          const betragTest = value.trim().replace(/[€\s]/g, '');
+          if (betragTest.match(/^-?\d+[.,]\d{2}$/) || betragTest.match(/^-?\d+$/)) {
+            betragCount++;
+          }
+        }
+      }
+    }
+    
+    datumScores[col] = datumCount;
+    betragScores[col] = betragCount;
+  }
+  
+  // Finde Spalte mit meisten Datumswerten
+  let bestDatumCol = -1;
+  let bestDatumScore = 0;
+  for (const [col, score] of Object.entries(datumScores)) {
+    if (score > bestDatumScore) {
+      bestDatumScore = score;
+      bestDatumCol = parseInt(col);
+    }
+  }
+  
+  // Finde Spalte mit meisten Betragswerten
+  let bestBetragCol = -1;
+  let bestBetragScore = 0;
+  for (const [col, score] of Object.entries(betragScores)) {
+    if (score > bestBetragScore) {
+      bestBetragScore = score;
+      bestBetragCol = parseInt(col);
+    }
+  }
+  
+  // Korrigiere Mapping wenn nötig
+  // Wenn gefundene Datum-Spalte weniger als 30% gültige Datumswerte hat, suche besser
+  if (mapping.datum >= 0 && datumScores[mapping.datum] < numTestRows * 0.3) {
+    if (bestDatumCol >= 0 && bestDatumScore > datumScores[mapping.datum]) {
+      Logger.log('Datum-Spalte korrigiert: ' + mapping.datum + ' → ' + bestDatumCol);
+      mapping.datum = bestDatumCol;
+    }
+  } else if (mapping.datum === -1 && bestDatumCol >= 0) {
+    mapping.datum = bestDatumCol;
+  }
+  
+  // Gleiches für Betrag
+  if (mapping.betrag >= 0 && betragScores[mapping.betrag] < numTestRows * 0.3) {
+    if (bestBetragCol >= 0 && bestBetragScore > betragScores[mapping.betrag]) {
+      Logger.log('Betrag-Spalte korrigiert: ' + mapping.betrag + ' → ' + bestBetragCol);
+      mapping.betrag = bestBetragCol;
+    }
+  } else if (mapping.betrag === -1 && bestBetragCol >= 0) {
+    mapping.betrag = bestBetragCol;
+  }
+  
+  // Fallback: Wenn immer noch nicht gefunden, erste 3 Spalten
   if (mapping.datum === -1) mapping.datum = 0;
   if (mapping.betrag === -1) mapping.betrag = 1;
-  if (mapping.verwendungszweck === -1) mapping.verwendungszweck = 2;
-
+  if (mapping.verwendungszweck === -1) {
+    // Suche nach Spalte die weder Datum noch Betrag ist
+    for (let col = 0; col < 10; col++) {
+      if (col !== mapping.datum && col !== mapping.betrag) {
+        mapping.verwendungszweck = col;
+        break;
+      }
+    }
+    if (mapping.verwendungszweck === -1) mapping.verwendungszweck = 2;
+  }
+  
   return mapping;
 }
 
@@ -427,6 +577,46 @@ function detectColumnMapping(headerRow) {
 function extractValue(row, index) {
   if (index < 0 || index >= row.length) return '';
   return row[index];
+}
+
+/**
+ * Öffnet Kontobewegungen-Sheet für Copy & Paste
+ * Das Sheet hat CSV-Struktur + Kategorisierungsfelder
+ */
+function oeffneKontobewegungen() {
+  try {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    let sheet = ss.getSheetByName('Kontobewegungen');
+
+    if (!sheet) {
+      // Sheet existiert nicht → erstelle es
+      initializeKontobewegungen();
+      sheet = ss.getSheetByName('Kontobewegungen');
+    }
+
+    ss.setActiveSheet(sheet);
+
+    showAlert(
+      '📋 KONTOBEWEGUNGEN (CSV-Struktur)\n\n' +
+      'Anleitung:\n' +
+      '1. Öffnen Sie Ihre CSV-Datei vom Online-Banking\n' +
+      '2. Markieren Sie die relevanten Zeilen\n' +
+      '3. Kopieren Sie die Daten (Strg+C)\n' +
+      '4. Fügen Sie sie hier ab Zeile 2 ein (Strg+V)\n' +
+      '5. Menü → 📋 Kontobewegungen → 🔄 Kategorien aktualisieren\n' +
+      '6. Prüfen Sie die Kategorisierungsfelder (grün)\n' +
+      '7. Status auf "Zugeordnet" setzen\n' +
+      '8. Menü → 📋 Kontobewegungen → ✅ Buchen\n\n' +
+      'SPALTEN:\n' +
+      '• Blau (A-L): CSV-Daten aus Bank-Export\n' +
+      '• Grün (M-R): Kategorisierungsfelder',
+      'Kontobewegungen'
+    );
+
+  } catch (e) {
+    logError('oeffneKontobewegungen', e);
+    showAlert('❌ Fehler:\n' + e.toString(), 'Fehler');
+  }
 }
 
 /**

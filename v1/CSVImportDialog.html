@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <base target="_top">
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      padding: 20px;
+      max-width: 500px;
+    }
+    h2 {
+      margin-top: 0;
+      color: #1a73e8;
+    }
+    .info {
+      background-color: #e8f0fe;
+      padding: 12px;
+      border-radius: 4px;
+      margin-bottom: 20px;
+      font-size: 13px;
+    }
+    .file-input-wrapper {
+      margin: 20px 0;
+    }
+    input[type="file"] {
+      width: 100%;
+      padding: 8px;
+      border: 1px solid #dadce0;
+      border-radius: 4px;
+      font-size: 14px;
+    }
+    .button-container {
+      display: flex;
+      gap: 10px;
+      justify-content: flex-end;
+      margin-top: 20px;
+    }
+    button {
+      padding: 10px 20px;
+      border: none;
+      border-radius: 4px;
+      font-size: 14px;
+      cursor: pointer;
+      font-weight: 500;
+    }
+    .btn-primary {
+      background-color: #1a73e8;
+      color: white;
+    }
+    .btn-primary:hover {
+      background-color: #1557b0;
+    }
+    .btn-secondary {
+      background-color: #f1f3f4;
+      color: #202124;
+    }
+    .btn-secondary:hover {
+      background-color: #e8eaed;
+    }
+    button:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+    .status {
+      margin-top: 15px;
+      padding: 10px;
+      border-radius: 4px;
+      display: none;
+    }
+    .status.success {
+      background-color: #e6f4ea;
+      color: #137333;
+      display: block;
+    }
+    .status.error {
+      background-color: #fce8e6;
+      color: #c5221f;
+      display: block;
+    }
+  </style>
+</head>
+<body>
+  <h2>📥 CSV-Datei importieren</h2>
+  
+  <div class="info">
+    <strong>Unterstützte Formate:</strong><br>
+    • Standard-CSV (Datum, Betrag, Verwendungszweck)<br>
+    • Sparkasse, Volksbank, etc.<br>
+    • Airbnb-Exporte
+  </div>
+
+  <div class="file-input-wrapper">
+    <label for="csvFile">CSV-Datei auswählen:</label>
+    <input type="file" id="csvFile" accept=".csv,text/csv" />
+  </div>
+
+  <div id="status" class="status"></div>
+
+  <div class="button-container">
+    <button class="btn-secondary" onclick="google.script.host.close()">Abbrechen</button>
+    <button class="btn-primary" id="importBtn" onclick="importFile()" disabled>Importieren</button>
+  </div>
+
+  <script>
+    const fileInput = document.getElementById('csvFile');
+    const importBtn = document.getElementById('importBtn');
+    const statusDiv = document.getElementById('status');
+
+    // Aktiviere Import-Button wenn Datei ausgewählt
+    fileInput.addEventListener('change', function(e) {
+      if (e.target.files.length > 0) {
+        importBtn.disabled = false;
+        statusDiv.className = 'status';
+        statusDiv.textContent = '';
+      } else {
+        importBtn.disabled = true;
+      }
+    });
+
+    function importFile() {
+      const file = fileInput.files[0];
+      
+      if (!file) {
+        showStatus('Bitte wählen Sie eine CSV-Datei aus.', 'error');
+        return;
+      }
+
+      // Prüfe Dateityp
+      if (!file.name.toLowerCase().endsWith('.csv') && file.type !== 'text/csv' && file.type !== '') {
+        showStatus('Bitte wählen Sie eine CSV-Datei aus.', 'error');
+        return;
+      }
+
+      importBtn.disabled = true;
+      importBtn.textContent = 'Importiere...';
+
+      const reader = new FileReader();
+      
+      reader.onload = function(e) {
+        const csvText = e.target.result;
+        
+        // Sende CSV-Text an Server
+        google.script.run
+          .withSuccessHandler(onImportSuccess)
+          .withFailureHandler(onImportError)
+          .processCSVImportFromDialog(csvText);
+      };
+
+      reader.onerror = function() {
+        showStatus('Fehler beim Lesen der Datei.', 'error');
+        importBtn.disabled = false;
+        importBtn.textContent = 'Importieren';
+      };
+
+      reader.readAsText(file, 'UTF-8');
+    }
+
+    function onImportSuccess(result) {
+      if (result.erfolg) {
+        google.script.host.close();
+        // Erfolgsmeldung wird vom Server angezeigt
+      } else {
+        showStatus('❌ Import fehlgeschlagen: ' + result.fehler, 'error');
+        importBtn.disabled = false;
+        importBtn.textContent = 'Importieren';
+      }
+    }
+
+    function onImportError(error) {
+      showStatus('❌ Fehler: ' + error.message, 'error');
+      importBtn.disabled = false;
+      importBtn.textContent = 'Importieren';
+    }
+
+    function showStatus(message, type) {
+      statusDiv.className = 'status ' + type;
+      statusDiv.textContent = message;
+    }
+  </script>
+</body>
+</html>
